@@ -1,4 +1,4 @@
-/* Sample code for basic Server */
+/* Server */
 
 public class Server {
   public static void main(String args[]) throws Exception {
@@ -15,4 +15,5 @@ public class Server {
     }
   }
 }
+
 
