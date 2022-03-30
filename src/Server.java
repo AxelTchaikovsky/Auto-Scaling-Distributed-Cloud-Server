@@ -7,34 +7,58 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 
 public class Server implements ServerInterface {
-  private int frontCount;
-  private int midCount;
-  private ServerLib serverLib;
+  private static final int FRONT = 0;
+  private static final int MID = 1;
+  private static int frontCount;
+  private static int midCount;
+  private static ServerLib SL;
+  private static ServerInfo info;
+  private static ServerInterface master;
 
-  private LinkedBlockingQueue<Cloud.FrontEndOps.Request> requestQueue;
-  private ConcurrentHashMap<Integer, Integer> id2TierMap;
+  private static LinkedBlockingQueue<Cloud.FrontEndOps.Request> requestQueue;
+  private static ConcurrentHashMap<Integer, Integer> id2TierMap;
 
   public static void main(String args[]) throws Exception {
     if (args.length != 3) {
       throw new Exception("Need 3 args: <cloud_ip> <cloud_port> <VM id>");
     }
-    ServerLib SL = new ServerLib(args[0], Integer.parseInt(args[1]));
+    String ip = args[0];
+    int port = Integer.parseInt(args[1]);
     int vmId = Integer.parseInt(args[2]);
 
-    System.err.println("[ Time: " + SL.getTime() + " ]");
-    int serverNum = 0;
-    if (SL.getTime() <= 6.0) {
-      serverNum = 2;
+    SL = new ServerLib(ip, port);
+
+    if (registerMaster(ip, port)) {
+      SL.register_frontend();
+      SL.startVM();
+      midCount++;
     } else {
-      serverNum = 4;
-    }
-    if (vmId == 1) {
-      for (int i = 0; i < serverNum; i++) {
-        SL.startVM();
+      master = getInstance(ip, port, "Master");
+      info.setMaster(false);
+      info.setTier(id2TierMap.get(info.getId()));
+      master.addVM(info.getId(), info.getTier());
+      if (info.getTier() == FRONT) {
+        registerFrontTier(ip, port, info.getId());
+        SL.register_frontend();
+      } else if (info.getTier() == MID) {
+        registerMidTier(ip, port, info.getId());
       }
     }
-    // register with load balancer so requests are sent to this server
-    SL.register_frontend();
+
+//    System.err.println("[ Time: " + SL.getTime() + " ]");
+//    int serverNum = 0;
+//    if (SL.getTime() <= 6.0) {
+//      serverNum = 2;
+//    } else {
+//      serverNum = 4;
+//    }
+//    if (vmId == 1) {
+//      for (int i = 0; i < serverNum; i++) {
+//        SL.startVM();
+//      }
+//    }
+//    // register with load balancer so requests are sent to this server
+//    SL.register_frontend();
 
     // main loop
     while (true) {
@@ -43,7 +67,7 @@ public class Server implements ServerInterface {
     }
   }
 
-  private ServerInterface getInstance(String ip, int port, String name) {
+  private static ServerInterface getInstance(String ip, int port, String name) {
     try {
       String url = String.format("//%s:%d/%s", ip, port, name);
       return (ServerInterface) Naming.lookup(url);
@@ -53,9 +77,16 @@ public class Server implements ServerInterface {
     }
   }
 
-  private boolean registerMaster(String ip, int port) {
+  /**
+   * Try register a server as a master server.
+   * @param ip server ip
+   * @param port server port
+   * @return true if master server have nor been registered, false otherwise.
+   */
+  private static boolean registerMaster(String ip, int port) {
     Server masterServer = new Server();
     frontCount++;
+    id2TierMap = new ConcurrentHashMap<>();
     requestQueue = new LinkedBlockingQueue<>();
     String url = String.format("//%s:%d/%s", ip, port, "Master");
     try {
@@ -69,7 +100,7 @@ public class Server implements ServerInterface {
     }
   }
 
-  private boolean registerFrontTier(String ip, int port, int id) {
+  private static boolean registerFrontTier(String ip, int port, int id) {
     Server frontServer = new Server();
     String url = String.format("//%s:%d/%s", ip, port, "Front" + id);
     try {
@@ -83,7 +114,7 @@ public class Server implements ServerInterface {
     }
   }
 
-  private boolean registerMidTier(String ip, int port, int id) {
+  private static boolean registerMidTier(String ip, int port, int id) {
     Server midServer = new Server();
     String url = String.format("//%s:%d/%s", ip, port, "Mid" + id);
     try {
@@ -97,7 +128,7 @@ public class Server implements ServerInterface {
     }
   }
 
-  private void shutDown(int vmId, String ip, int port) {
+  private static void shutDown(int vmId, String ip, int port) {
     ServerInterface server = null;
     int tierId = id2TierMap.get(vmId);
     if (tierId == 0) {
@@ -105,8 +136,8 @@ public class Server implements ServerInterface {
     } else if (tierId == 1) {
       server = getInstance(ip,port, "Mid" + vmId);
     }
-    serverLib.interruptGetNext();
-    serverLib.shutDown();
+    SL.interruptGetNext();
+    SL.shutDown();
     try {
       UnicastRemoteObject.unexportObject(server, true);
     } catch (NoSuchObjectException e) {
@@ -128,7 +159,7 @@ public class Server implements ServerInterface {
 
   @Override
   public void scaleOut(int tierId) {
-    int vmId = serverLib.startVM();
+    int vmId = SL.startVM();
     addVM(vmId, tierId);
   }
 
