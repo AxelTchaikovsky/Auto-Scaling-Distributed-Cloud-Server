@@ -2,7 +2,10 @@
 
 import java.io.IOException;
 import java.net.MalformedURLException;
-import java.rmi.*;
+import java.rmi.AlreadyBoundException;
+import java.rmi.Naming;
+import java.rmi.NotBoundException;
+import java.rmi.RemoteException;
 import java.rmi.server.RMISocketFactory;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.Date;
@@ -13,16 +16,16 @@ import java.util.concurrent.TimeUnit;
 public class Server extends UnicastRemoteObject implements ServerInterface {
   private static final int FRONT = 0;
   private static final int MID = 1;
+  private static final long allowedIdleCycle = 7000;
+  private static final double frontFactor = 1.3;
+  private static final int allowedMasterProcess = 11;
+  private static final ServerInfo info = new ServerInfo();
+  private static final double midFactor = 1.2;
   private static int frontCount = 0;
   private static int midCount = 0;
   private static long lastProcessTime = 0;
-  private static final long allowedIdleCycle = 7000;
-  private static final double frontFactor = 1.3;
   private static int masterProcessCount = 0;
-  private static final int allowedMasterProcess = 11;
   private static ServerLib SL;
-  private static final ServerInfo info = new ServerInfo();
-  private static final double midFactor = 1.2;
   private static int fastRequestCount = 0;
 
   private static LinkedBlockingQueue<Cloud.FrontEndOps.Request> requestQueue;
@@ -177,7 +180,7 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
           SL.drop(r);
         }
         master.scaleOut(1);
-      }else {
+      } else {
 //        System.err.println("[ Processing request " + r + " ]");
         SL.processRequest(r);
         lastProcessTime = now.getTime();
@@ -201,7 +204,8 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
 
   /**
    * Try register a server as a master server.
-   * @param ip server ip
+   *
+   * @param ip   server ip
    * @param port server port
    * @return true if master server have nor been registered, false otherwise.
    */
@@ -225,9 +229,10 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
 
   /**
    * Bind the current server to a remote object.
-   * @param ip server ip address
+   *
+   * @param ip   server ip address
    * @param port server port
-   * @param id virtual machine id
+   * @param id   virtual machine id
    * @throws RemoteException when RMI fails
    */
   private static void registerServer(String ip, int port, int id) throws RemoteException {
@@ -243,9 +248,10 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
 
   /**
    * Unbind the current server from RMI.
-   * @param ip server ip address
+   *
+   * @param ip   server ip address
    * @param port server port
-   * @param id virtual machine id
+   * @param id   virtual machine id
    */
   private static void unRegisterServer(String ip, int port, int id) {
     ServerInterface server = getInstance(ip, port, Integer.toString(id));
@@ -258,8 +264,9 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
 
   /**
    * Shut down itself by ID.
+   *
    * @param vmId virtual machine's id
-   * @param ip ip address
+   * @param ip   ip address
    * @param port server port
    */
   private static void shutDown(int vmId, String ip, int port) {
@@ -279,7 +286,8 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
   /**
    * When current server is the master server, add (vmId, tierId) pair to
    * hashmap.
-   * @param vmId virtual machine's id
+   *
+   * @param vmId   virtual machine's id
    * @param tierId 0 for front-tier, 1 for mid-tier
    */
   public synchronized static void addVM2Map(int vmId, int tierId) {
@@ -300,9 +308,35 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
 
   }
 
+  private synchronized static void masterAddRequest(Cloud.FrontEndOps.Request request) {
+    requestQueue.add(request);
+  }
+
+  private static void scaleOutCore(int tierId) {
+    int vmId = SL.startVM();
+//    System.err.println("masterScaleOut: adding... " + vmId);
+    addVM2Map(vmId, tierId);
+//    System.err.println("masterScaleOut: Done~ " + vmId);
+
+    if (tierId == 0) {
+      frontCount++;
+    } else {
+      midCount++;
+    }
+  }
+
+  public static void masterScaleOut(int tierId) {
+    scaleOutCore(tierId);
+  }
+
+  private static int masterGetRequestLength() {
+    return requestQueue.size();
+  }
+
   /**
    * Master server operation: delete virtual machine from hashmap, decrement
    * counter.
+   *
    * @param vmId ID of virtual machine.
    */
   @Override
@@ -336,28 +370,7 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     return id2TierMap.get(id);
   }
 
-  private synchronized static void masterAddRequest(Cloud.FrontEndOps.Request request) {
-    requestQueue.add(request);
-  }
-
   public void scaleOut(int tierId) throws RemoteException {
-    scaleOutCore(tierId);
-  }
-
-  private static void scaleOutCore(int tierId) {
-    int vmId = SL.startVM();
-//    System.err.println("masterScaleOut: adding... " + vmId);
-    addVM2Map(vmId, tierId);
-//    System.err.println("masterScaleOut: Done~ " + vmId);
-
-    if (tierId == 0) {
-      frontCount++;
-    } else {
-      midCount++;
-    }
-  }
-
-  public static void masterScaleOut(int tierId) {
     scaleOutCore(tierId);
   }
 
@@ -390,10 +403,6 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
   @Override
   public ServerLib getSL() {
     return SL;
-  }
-
-  private static int masterGetRequestLength() {
-    return requestQueue.size();
   }
 }
 
