@@ -1,7 +1,7 @@
 public class ServerInfo {
-  private int tier;
-  private boolean isMaster;
-  private int id;
+  private int tier = 1;
+  private boolean isMaster = false;
+  private int id = 0;
 
   public boolean isMaster() {
     return isMaster;
@@ -26,4 +26,5 @@ public class ServerInfo {
   public void setTier(int tier) {
     this.tier = tier;
   }
+
 }
