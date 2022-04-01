@@ -59,57 +59,24 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     vmId = Integer.parseInt(args[2]);
 
     info.setId(vmId);
-
     SL = new ServerLib(ip, port);
-    ServerInterface master = null;
 
-    if (registerMaster(ip, port)) {
+    if (vmId == 1) {
+      registerMaster(ip, port);
       masterHandler();
     } else {
-      // set current process as non-master
-      info.setMaster(false);
-      // get master object by RMI
-      master = getInstance("Master");
-      System.err.println("before getTier: " + info.getId());
-//      while (master.getTier(info.getId()) == -1) {
-//        TimeUnit.SECONDS.sleep(1);
-//      }
-      info.setTier(master.getTier(info.getId()));
-
-      if (info.getTier() == FRONT) {
-        System.err.println("[ Is frontend Server... ]");
-        registerServer(ip, port, info.getId());
-        SL.register_frontend();
-      } else if (info.getTier() == MID) {
-        System.err.println("[ Is mid-tier Server... ]");
-        registerServer(ip, port, info.getId());
-      } else {
-        assert false;
+      ServerInterface master = getInstance("Master");
+      switch (master.getTier(vmId)) {
+        case FRONT:
+          frontHandler(master);
+          break;
+        case MID:
+          midHandler(master);
+          break;
+        default:
+          assert false;
+          break;
       }
-    }
-
-    Cloud.DatabaseOps cache = null;
-    try {
-      cache = (Cloud.DatabaseOps) Naming.lookup(String.format("//%s:%d/%s", ip, port, "Cache"));
-    } catch (NotBoundException e) {
-      e.printStackTrace(System.err);
-    }
-
-    // main loop
-    try {
-      while (true) {
-        if (info.isMaster()) {
-          masterRoutine();
-        } else {
-          if (info.getTier() == FRONT) {
-            frontRoutine(master);
-          } else if (info.getTier() == MID) {
-            midRoutine(master, cache);
-          }
-        }
-      }
-    } catch (Exception e) {
-      // Catches the EOF exception introduced by the infinite loop.
     }
   }
 
@@ -136,6 +103,33 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     try {
       while (true) {
         masterRoutine();
+      }
+    } catch (Exception e) {
+      // Do nothing
+    }
+  }
+
+  private static void frontHandler(ServerInterface master) throws RemoteException {
+    System.err.println("[ Is frontend Server... ]");
+    registerServer(ip, port, info.getId());
+    SL.register_frontend();
+    try {
+      while (true) {
+        frontRoutine(master);
+      }
+    } catch (Exception e) {
+      // Do nothing
+    }
+  }
+
+  private static void midHandler(ServerInterface master) throws RemoteException,
+          MalformedURLException {
+    System.err.println("[ Is mid-tier Server... ]");
+    registerServer(ip, port, info.getId());
+    Cloud.DatabaseOps cache = getCache();
+    try {
+      while (true) {
+        midRoutine(master, cache);
       }
     } catch (Exception e) {
       // Do nothing
@@ -385,6 +379,16 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     } catch (RemoteException | MalformedURLException | AlreadyBoundException e) {
       e.printStackTrace();
     }
+  }
+
+  private static Cloud.DatabaseOps getCache() throws MalformedURLException, RemoteException {
+    Cloud.DatabaseOps cache = null;
+    try {
+      cache = (Cloud.DatabaseOps) Naming.lookup(String.format("//%s:%d/%s", ip, port, "Cache"));
+    } catch (NotBoundException e) {
+      e.printStackTrace(System.err);
+    }
+    return cache;
   }
 
   /**
