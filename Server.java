@@ -16,10 +16,10 @@ import java.util.concurrent.TimeUnit;
 public class Server extends UnicastRemoteObject implements ServerInterface {
   private static final int FRONT = 0;
   private static final int MID = 1;
-  private static final int allowedMasterProcess = 11;
-  private static final double frontFactor = 2.5;
-  private static final double midFactor = 2;
-  private static final long allowedIdleCycle = 7000;
+  private static final int allowedMasterProcess = 15;
+  private static final double frontFactor = 5;
+  private static final double midFactor = 3;
+  private static final long allowedIdleCycle = 2000;
   private static final ServerInfo info = new ServerInfo();
   private static final int fastRequestInterval = 400;
   private static int frontCount = 0;
@@ -30,6 +30,12 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
   private static int fastRequestCount = 0;
   private static LinkedBlockingQueue<Cloud.FrontEndOps.Request> requestQueue;
   private static ConcurrentHashMap<Integer, Integer> id2TierMap;
+  private static long masterStartTime;
+  private static int shortQueueCount;
+  private static long lastMeasureTime;
+  private static String ip;
+  private static int port;
+  private static int vmId;
 
   /**
    * Creates and exports a new UnicastRemoteObject object using an anonymous port.
@@ -48,9 +54,9 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     if (args.length != 3) {
       throw new Exception("Need 3 args: <cloud_ip> <cloud_port> <VM id>");
     }
-    String ip = args[0];
-    int port = Integer.parseInt(args[1]);
-    int vmId = Integer.parseInt(args[2]);
+    ip = args[0];
+    port = Integer.parseInt(args[1]);
+    vmId = Integer.parseInt(args[2]);
 
     info.setId(vmId);
 
@@ -58,27 +64,16 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     ServerInterface master = null;
 
     if (registerMaster(ip, port)) {
-      // Start cache
-      startCache(ip, port);
-      // Set current process as master
-      info.setMaster(true);
-      // Add (vmId, tier) pair to master hashmap
-      addVM2Map(vmId, 0);
-      // Register self as frontend
-      SL.register_frontend();
-      // ++ master's frontend counter
-      frontCount++;
-      // Add 1 new mid tier server
-      masterScaleOut(1);
+      masterHandler();
     } else {
       // set current process as non-master
       info.setMaster(false);
       // get master object by RMI
-      master = getInstance(ip, port, "Master");
+      master = getInstance("Master");
       System.err.println("before getTier: " + info.getId());
-      while (master.getTier(info.getId()) == -1) {
-        TimeUnit.SECONDS.sleep(1);
-      }
+//      while (master.getTier(info.getId()) == -1) {
+//        TimeUnit.SECONDS.sleep(1);
+//      }
       info.setTier(master.getTier(info.getId()));
 
       if (info.getTier() == FRONT) {
@@ -107,15 +102,43 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
           masterRoutine();
         } else {
           if (info.getTier() == FRONT) {
-            Cloud.FrontEndOps.Request r = SL.getNextRequest();
-            master.addRequest(r);
+            frontRoutine(master);
           } else if (info.getTier() == MID) {
-            midRoutine(ip, port, master, cache);
+            midRoutine(master, cache);
           }
         }
       }
     } catch (Exception e) {
       // Catches the EOF exception introduced by the infinite loop.
+    }
+  }
+
+  /**
+   * Handle master server life cycle.
+   */
+  private static void masterHandler() {
+    /*
+     Start cache
+     Set current process as master
+     Add (vmId, tier) pair to master hashmap
+     Register self as frontend
+     ++ master's frontend counter
+     Add 1 new mid-tier server
+    */
+    startCache(ip, port);
+    info.setMaster(true);
+    addVM2Map(vmId, 0);
+    SL.register_frontend();
+    masterStartTime = new Date().getTime();
+    frontCount++;
+    masterScaleOut(1);
+
+    try {
+      while (true) {
+        masterRoutine();
+      }
+    } catch (Exception e) {
+      // Do nothing
     }
   }
 
@@ -133,14 +156,67 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     }
   }
 
+  private static void frontRoutine(ServerInterface master) throws RemoteException {
+    if (frontScaleIn(ip, port, master)) return;
+    Cloud.FrontEndOps.Request r = SL.getNextRequest();
+    master.addRequest(r);
+  }
+
+  private static boolean frontScaleIn(String ip, int port, ServerInterface master) throws RemoteException {
+    int frontMasterCnt = master.getVMCount(0);
+    int masterRequestLen = master.getRequestLength();
+    if (masterRequestLen < 2) {
+      shortQueueCount++;
+      if (shortQueueCount > 40 && frontMasterCnt > 1) {
+        shutDown(info.getId());
+        return true;
+      }
+    } else {
+      shortQueueCount = 0;
+    }
+    return false;
+  }
+
+  private static boolean midScaleIn(String ip, int port, ServerInterface master) throws RemoteException {
+    int midMasterCnt = master.getVMCount(1);
+    int masterRequestLen = master.getRequestLength();
+    if (masterRequestLen < 1) {
+      shortQueueCount++;
+      if (shortQueueCount > 60 && midMasterCnt > 1) {
+        shutDown(info.getId());
+        return true;
+      }
+    } else {
+      shortQueueCount = 0;
+    }
+    return false;
+  }
+
+
   private static void handleBooting() {
     Date now = new Date();
+    long timeDiff = now.getTime() - masterStartTime;
+//    System.err.println("[ Started for:" + timeDiff + "; queue len: " + SL.getQueueLength() + " ]");
+    if (timeDiff > 1000) {
+      int queueLen = SL.getQueueLength();
+//      System.err.println("[ Started for:" + timeDiff + "; queue len: " + queueLen + " ]");
+      if (queueLen != 0) {
+        if (timeDiff / queueLen < 185) {
+          System.err.println("[ Rate over 1000/150, start 3 mid 1 front ]");
+          masterScaleOut(0);
+          masterScaleOut(1);
+          masterScaleOut(1);
+          masterScaleOut(1);
+        }
+      }
+      masterStartTime = Long.MAX_VALUE;
+    }
     if (masterProcessCount < allowedMasterProcess) {
       Cloud.FrontEndOps.Request r = SL.getNextRequest();
       SL.processRequest(r);
       masterProcessCount++;
       long timeNow = now.getTime();
-      if (lastProcessTime != 0 && timeNow - lastProcessTime < 1000) {
+      if (lastProcessTime != 0 && timeNow - lastProcessTime < 800) {
         SL.dropHead();
       }
       lastProcessTime = timeNow;
@@ -149,14 +225,15 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     }
   }
 
-  private static void midRoutine(String ip, int port, ServerInterface master, Cloud.DatabaseOps cache) throws IOException {
+  private static void midRoutine(ServerInterface master, Cloud.DatabaseOps cache) throws IOException {
     int midMasterCnt = master.getVMCount(1);
     int masterRequestLen = master.getRequestLength();
     Date now = new Date();
     if (lastProcessTime != 0 && now.getTime() - lastProcessTime > allowedIdleCycle && midMasterCnt > 1) {
-      shutDown(info.getId(), ip, port);
+      shutDown(info.getId());
       return;
     }
+//    if (midScaleIn(ip, port, master)) return;
     Cloud.FrontEndOps.Request r = master.pollRequest();
     if (r != null) {
       if (dropFastRequest(now, r)) return;
@@ -196,7 +273,7 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     return false;
   }
 
-  private static ServerInterface getInstance(String ip, int port, String name) {
+  private static ServerInterface getInstance(String name) {
     try {
       String url = String.format("//%s:%d/%s", ip, port, name);
       return (ServerInterface) Naming.lookup(url);
@@ -252,33 +329,15 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
   }
 
   /**
-   * Unbind the current server from RMI.
-   *
-   * @param ip   server ip address
-   * @param port server port
-   * @param id   virtual machine id
-   */
-  private static void unRegisterServer(String ip, int port, int id) {
-    ServerInterface server = getInstance(ip, port, Integer.toString(id));
-    try {
-      UnicastRemoteObject.unexportObject(server, true);
-    } catch (RemoteException e) {
-      e.printStackTrace(System.err);
-    }
-  }
-
-  /**
    * Shut down itself by ID.
    *
    * @param vmId virtual machine's id
-   * @param ip   ip address
-   * @param port server port
    */
-  private static void shutDown(int vmId, String ip, int port) {
+  private static void shutDown(int vmId) {
     System.out.println("[ Shutting down " + vmId + " ]");
     SL.shutDown();
     try {
-      ServerInterface master = getInstance(ip, port, "Master");
+      ServerInterface master = getInstance("Master");
       assert master != null;
       master.deleteVMFromMap(vmId);
     } catch (RemoteException e) {

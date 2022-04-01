@@ -26,5 +26,4 @@ public class ServerInfo {
   public void setTier(int tier) {
     this.tier = tier;
   }
-
 }
