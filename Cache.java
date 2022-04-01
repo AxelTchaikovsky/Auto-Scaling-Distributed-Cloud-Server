@@ -1,13 +1,11 @@
 import java.rmi.RemoteException;
-import java.rmi.server.RMIClientSocketFactory;
-import java.rmi.server.RMIServerSocketFactory;
 import java.rmi.server.RMISocketFactory;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class Cache extends UnicastRemoteObject implements Cloud.DatabaseOps {
   private static ServerLib SL;
-  private final Cloud.DatabaseOps DB = SL.getDB();
+  private static Cloud.DatabaseOps DB;
   private ConcurrentHashMap<String, String> cacheMap = new ConcurrentHashMap<>();
 
   /**
@@ -19,41 +17,9 @@ public class Cache extends UnicastRemoteObject implements Cloud.DatabaseOps {
    * @throws RemoteException if failed to export object
    * @since JDK1.1
    */
-  protected Cache() throws RemoteException {
-  }
-
-  /**
-   * Creates and exports a new UnicastRemoteObject object using the particular supplied port.
-   *
-   * <p>The object is exported with a server socket
-   * created using the {@link RMISocketFactory} class.
-   *
-   * @param port the port number on which the remote object receives calls (if <code>port</code> is
-   *             zero, an anonymous port is chosen)
-   * @throws RemoteException if failed to export object
-   * @since 1.2
-   */
-  protected Cache(int port) throws RemoteException {
-    super(port);
-  }
-
-  /**
-   * Creates and exports a new UnicastRemoteObject object using the particular supplied port and
-   * socket factories.
-   *
-   * <p>Either socket factory may be {@code null}, in which case
-   * the corresponding client or server socket creation method of {@link RMISocketFactory} is used
-   * instead.
-   *
-   * @param port the port number on which the remote object receives calls (if <code>port</code> is
-   *             zero, an anonymous port is chosen)
-   * @param csf  the client-side socket factory for making calls to the remote object
-   * @param ssf  the server-side socket factory for receiving remote calls
-   * @throws RemoteException if failed to export object
-   * @since 1.2
-   */
-  protected Cache(int port, RMIClientSocketFactory csf, RMIServerSocketFactory ssf) throws RemoteException {
-    super(port, csf, ssf);
+  protected Cache(String ip, int port) throws RemoteException {
+    SL = new ServerLib(ip, port);
+    DB = SL.getDB();
   }
 
   @Override

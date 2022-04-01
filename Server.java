@@ -21,7 +21,7 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
   private static final double midFactor = 2;
   private static final long allowedIdleCycle = 7000;
   private static final ServerInfo info = new ServerInfo();
-  private static final int fastRequestInterval = 500;
+  private static final int fastRequestInterval = 400;
   private static int frontCount = 0;
   private static int midCount = 0;
   private static long lastProcessTime = 0;
@@ -58,6 +58,8 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     ServerInterface master = null;
 
     if (registerMaster(ip, port)) {
+      // Start cache
+      startCache(ip, port);
       // Set current process as master
       info.setMaster(true);
       // Add (vmId, tier) pair to master hashmap
@@ -91,6 +93,13 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
       }
     }
 
+    Cloud.DatabaseOps cache = null;
+    try {
+      cache = (Cloud.DatabaseOps) Naming.lookup(String.format("//%s:%d/%s", ip, port, "Cache"));
+    } catch (NotBoundException e) {
+      e.printStackTrace(System.err);
+    }
+
     // main loop
     try {
       while (true) {
@@ -101,7 +110,7 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
             Cloud.FrontEndOps.Request r = SL.getNextRequest();
             master.addRequest(r);
           } else if (info.getTier() == MID) {
-            midRoutine(ip, port, master);
+            midRoutine(ip, port, master, cache);
           }
         }
       }
@@ -140,7 +149,7 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     }
   }
 
-  private static void midRoutine(String ip, int port, ServerInterface master) throws IOException {
+  private static void midRoutine(String ip, int port, ServerInterface master, Cloud.DatabaseOps cache) throws IOException {
     int midMasterCnt = master.getVMCount(1);
     int masterRequestLen = master.getRequestLength();
     Date now = new Date();
@@ -152,11 +161,11 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     if (r != null) {
       if (dropFastRequest(now, r)) return;
       if (masterRequestLen > midMasterCnt * midFactor) {
+        master.scaleOut(1);
         SL.drop(r);
         SL.dropTail();
-        master.scaleOut(1);
       } else {
-        SL.processRequest(r);
+        SL.processRequest(r, cache);
         lastProcessTime = now.getTime();
       }
     } else {
@@ -167,7 +176,7 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
   }
 
   /**
-   * Drop one request if there is 5 request coming in a row with interval less than 500.
+   * Drop one request if there is 10 request coming in a row with interval less than 500.
    *
    * @param now The current time
    * @param r   the request from the top of master queue
@@ -179,7 +188,7 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     } else {
       fastRequestCount = 0;
     }
-    if (fastRequestCount > 5) {
+    if (fastRequestCount > 20) {
       SL.drop(r);
       fastRequestCount = 0;
       return true;
@@ -273,6 +282,7 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
       assert master != null;
       master.deleteVMFromMap(vmId);
     } catch (RemoteException e) {
+      // TODO: Shut down exception connection refused (283) and unmarshall (283)
       e.printStackTrace(System.err);
     }
     System.exit(0);
@@ -308,8 +318,14 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     scaleOutCore(tierId);
   }
 
-  private static int masterGetRequestLength() {
-    return requestQueue.size();
+  private static void startCache(String ip, int port) {
+    try {
+       Cache cache = new Cache(ip, port);
+      String url = String.format("//%s:%d/%s", ip, port, "Cache");
+      Naming.bind(url, cache);
+    } catch (RemoteException | MalformedURLException | AlreadyBoundException e) {
+      e.printStackTrace();
+    }
   }
 
   /**
