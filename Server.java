@@ -11,14 +11,14 @@ import java.rmi.server.UnicastRemoteObject;
 import java.util.Date;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
 
 public class Server extends UnicastRemoteObject implements ServerInterface {
   private static final int FRONT = 0;
   private static final int MID = 1;
   private static final int allowedMasterProcess = 15;
-  private static final double frontFactor = 5;
-  private static final double midFactor = 3;
+  private static final double frontFactor = 2.8;
+  private static final int addFrontInterval = 4000;
+  private static final double midFactor = 3.3;
   private static final long allowedIdleCycle = 2000;
   private static final ServerInfo info = new ServerInfo();
   private static final int fastRequestInterval = 400;
@@ -32,10 +32,11 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
   private static ConcurrentHashMap<Integer, Integer> id2TierMap;
   private static long masterStartTime;
   private static int shortQueueCount;
-  private static long lastMeasureTime;
+  private static long lastAddFrontTime;
   private static String ip;
   private static int port;
   private static int vmId;
+  private static int nullRequestCount = 0;
 
   /**
    * Creates and exports a new UnicastRemoteObject object using an anonymous port.
@@ -85,19 +86,21 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
    */
   private static void masterHandler() {
     /*
-     Start cache
-     Set current process as master
-     Add (vmId, tier) pair to master hashmap
-     Register self as frontend
-     ++ master's frontend counter
-     Add 1 new mid-tier server
+     1. Start cache
+     2. Set current process as master
+     3. Add (vmId, tier) pair to master hashmap
+     4. Register self as frontend
+     6. ++ master's frontend counter
+     7. Add 1 new front-end server and 1 new mid-tier server
     */
+    Date now = new Date();
     startCache(ip, port);
     info.setMaster(true);
     addVM2Map(vmId, 0);
     SL.register_frontend();
-    masterStartTime = new Date().getTime();
+    masterStartTime = now.getTime();
     frontCount++;
+    masterScaleOut(0);
     masterScaleOut(1);
 
     try {
@@ -109,6 +112,12 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     }
   }
 
+  /**
+   * Manage front-tier server life cycle.
+   *
+   * @param master the master node.
+   * @throws RemoteException when RMI call fails.
+   */
   private static void frontHandler(ServerInterface master) throws RemoteException {
     System.err.println("[ Is frontend Server... ]");
     registerServer(ip, port, info.getId());
@@ -122,6 +131,12 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     }
   }
 
+  /**
+   * Manage mid-tier server life cycle.
+   *
+   * @param master the master node.
+   * @throws RemoteException when RMI call fails.
+   */
   private static void midHandler(ServerInterface master) throws RemoteException,
           MalformedURLException {
     System.err.println("[ Is mid-tier Server... ]");
@@ -136,6 +151,58 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     }
   }
 
+  private static void midRoutine(ServerInterface master, Cloud.DatabaseOps cache) throws IOException {
+    Date now = new Date();
+    int midMasterCnt = master.getVMCount(1);
+    int masterRequestLen = master.getRequestLength();
+    if (lastProcessTime != 0 && now.getTime() - lastProcessTime > allowedIdleCycle && midMasterCnt > 1) {
+      shutDown(info.getId());
+      return;
+    }
+    Cloud.FrontEndOps.Request r = master.pollRequest();
+    if (r != null) {
+      if (dropFastRequest(r)) return;
+      if (masterRequestLen > midMasterCnt * midFactor) {
+        master.scaleOut(1);
+        SL.drop(r);
+        SL.dropTail();
+      } else {
+        SL.processRequest(r, cache);
+        lastProcessTime = now.getTime();
+      }
+    } else {
+      if (lastProcessTime == 0) {
+        lastProcessTime = now.getTime();
+      }
+    }
+  }
+
+  private static void midRoutine2(ServerInterface master, Cloud.DatabaseOps cache) throws IOException {
+    int midMasterCnt = master.getVMCount(1);
+    int masterRequestLen = master.getRequestLength();
+    if (nullRequestCount > 5 && midMasterCnt > 1) {
+      shutDown(info.getId());
+      nullRequestCount = 0;
+      return;
+    }
+    Cloud.FrontEndOps.Request r = master.pollRequest();
+    if (r != null) {
+      if (dropFastRequest(r)) return;
+      if (masterRequestLen > midMasterCnt * midFactor) {
+        master.scaleOut(1);
+        SL.drop(r);
+        SL.dropTail();
+      } else {
+        SL.processRequest(r, cache);
+      }
+    } else {
+      nullRequestCount++;
+    }
+  }
+
+  /**
+   * Master server main loop's core implementation.
+   */
   private static void masterRoutine() {
     if (SL.getStatusVM(2) == Cloud.CloudOps.VMStatus.Booting) {
       handleBooting();
@@ -145,23 +212,44 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
       masterAddRequest(r);
     }
     // TODO: Conditional Scale out
-    if (SL.getQueueLength() > frontFactor * frontCount) {
+    Date now = new Date();
+    if (lastAddFrontTime == 0) lastAddFrontTime = now.getTime();
+    int queueLen = SL.getQueueLength();
+    if (now.getTime() - lastAddFrontTime > addFrontInterval
+            && queueLen > frontFactor * frontCount) {
       masterScaleOut(0);
+      lastAddFrontTime = now.getTime();
+      System.err.println("[ last add front time: " + lastAddFrontTime + "]");
+      System.err.println("[ queue len: " + queueLen + ", front count: " + frontCount + "]");
     }
   }
 
+  /**
+   * Frontend server main loop's core implementation.
+   *
+   * @param master master server
+   * @throws RemoteException when RMI call fails
+   */
   private static void frontRoutine(ServerInterface master) throws RemoteException {
-    if (frontScaleIn(ip, port, master)) return;
+    if (frontScaleIn(master)) return;
     Cloud.FrontEndOps.Request r = SL.getNextRequest();
     master.addRequest(r);
   }
 
-  private static boolean frontScaleIn(String ip, int port, ServerInterface master) throws RemoteException {
+  /**
+   * Frontend server scale in strategy, if queue stays under 2 in length for 100 cycles, shutdown
+   * current front server.
+   *
+   * @param master master server
+   * @return true if current server is closed
+   * @throws RemoteException when RMI call fails
+   */
+  private static boolean frontScaleIn(ServerInterface master) throws RemoteException {
     int frontMasterCnt = master.getVMCount(0);
     int masterRequestLen = master.getRequestLength();
     if (masterRequestLen < 2) {
       shortQueueCount++;
-      if (shortQueueCount > 40 && frontMasterCnt > 1) {
+      if (shortQueueCount > 65 && frontMasterCnt > 1) {
         shutDown(info.getId());
         return true;
       }
@@ -171,7 +259,7 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     return false;
   }
 
-  private static boolean midScaleIn(String ip, int port, ServerInterface master) throws RemoteException {
+  private static boolean midScaleIn(ServerInterface master) throws RemoteException {
     int midMasterCnt = master.getVMCount(1);
     int masterRequestLen = master.getRequestLength();
     if (masterRequestLen < 1) {
@@ -187,10 +275,16 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
   }
 
 
+  /**
+   * Master's procedure when the first mid-tier sever is still booting. Process at most 15 requests
+   * and when process interval is smaller than 800 ms, drop the first request in the serverLib
+   * queue. When rate is too high during booting, start 3 middle-tier and 1 front-tier in a row.
+   */
   private static void handleBooting() {
     Date now = new Date();
     long timeDiff = now.getTime() - masterStartTime;
-//    System.err.println("[ Started for:" + timeDiff + "; queue len: " + SL.getQueueLength() + " ]");
+//    System.err.println("[ Started for:" + timeDiff + "; queue len: " + SL.getQueueLength() + "
+//    ]");
     if (timeDiff > 1000) {
       int queueLen = SL.getQueueLength();
 //      System.err.println("[ Started for:" + timeDiff + "; queue len: " + queueLen + " ]");
@@ -209,51 +303,23 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
       Cloud.FrontEndOps.Request r = SL.getNextRequest();
       SL.processRequest(r);
       masterProcessCount++;
-      long timeNow = now.getTime();
-      if (lastProcessTime != 0 && timeNow - lastProcessTime < 800) {
+      if (lastProcessTime != 0 && now.getTime() - lastProcessTime < 800) {
         SL.dropHead();
       }
-      lastProcessTime = timeNow;
+      lastProcessTime = now.getTime();
     } else {
       SL.dropHead();
-    }
-  }
-
-  private static void midRoutine(ServerInterface master, Cloud.DatabaseOps cache) throws IOException {
-    int midMasterCnt = master.getVMCount(1);
-    int masterRequestLen = master.getRequestLength();
-    Date now = new Date();
-    if (lastProcessTime != 0 && now.getTime() - lastProcessTime > allowedIdleCycle && midMasterCnt > 1) {
-      shutDown(info.getId());
-      return;
-    }
-//    if (midScaleIn(ip, port, master)) return;
-    Cloud.FrontEndOps.Request r = master.pollRequest();
-    if (r != null) {
-      if (dropFastRequest(now, r)) return;
-      if (masterRequestLen > midMasterCnt * midFactor) {
-        master.scaleOut(1);
-        SL.drop(r);
-        SL.dropTail();
-      } else {
-        SL.processRequest(r, cache);
-        lastProcessTime = now.getTime();
-      }
-    } else {
-      if (lastProcessTime == 0) {
-        lastProcessTime = now.getTime();
-      }
     }
   }
 
   /**
    * Drop one request if there is 10 request coming in a row with interval less than 500.
    *
-   * @param now The current time
-   * @param r   the request from the top of master queue
+   * @param r the request from the top of master queue
    * @return true if condition are met and request is dropped, false otherwise.
    */
-  private static boolean dropFastRequest(Date now, Cloud.FrontEndOps.Request r) {
+  private static boolean dropFastRequest(Cloud.FrontEndOps.Request r) {
+    Date now = new Date();
     if (now.getTime() - lastProcessTime < fastRequestInterval) {
       fastRequestCount++;
     } else {
@@ -267,6 +333,12 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     return false;
   }
 
+  /**
+   * Get VM instance by its registered name.
+   *
+   * @param name "Master" for master server, other server are denoted by vmId.
+   * @return the {@link ServerInterface} object
+   */
   private static ServerInterface getInstance(String name) {
     try {
       String url = String.format("//%s:%d/%s", ip, port, name);
@@ -282,9 +354,8 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
    *
    * @param ip   server ip
    * @param port server port
-   * @return true if master server have nor been registered, false otherwise.
    */
-  private static boolean registerMaster(String ip, int port) {
+  private static void registerMaster(String ip, int port) {
     try {
       Server master = new Server();
       id2TierMap = new ConcurrentHashMap<>();
@@ -292,14 +363,13 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
       String url = String.format("//%s:%d/%s", ip, port, "Master");
       Naming.bind(url, master);
     } catch (AlreadyBoundException e) {
-      return false;
+      return;
     } catch (RemoteException | MalformedURLException e) {
       System.err.println("[ Failed creating unicast object ]");
       e.printStackTrace();
       System.exit(-1);
     }
     System.err.println("[ Successfully registered master ]");
-    return true;
   }
 
   /**
@@ -328,7 +398,7 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
    * @param vmId virtual machine's id
    */
   private static void shutDown(int vmId) {
-    System.out.println("[ Shutting down " + vmId + " ]");
+    System.out.println("[ Shutting down " + vmId + " at " + new Date().getTime() + " ]");
     SL.shutDown();
     try {
       ServerInterface master = getInstance("Master");
@@ -371,9 +441,15 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     scaleOutCore(tierId);
   }
 
+  /**
+   * Register cache to the RMI ip and port.
+   *
+   * @param ip   ip address
+   * @param port RMI port
+   */
   private static void startCache(String ip, int port) {
     try {
-       Cache cache = new Cache(ip, port);
+      Cache cache = new Cache(ip, port);
       String url = String.format("//%s:%d/%s", ip, port, "Cache");
       Naming.bind(url, cache);
     } catch (RemoteException | MalformedURLException | AlreadyBoundException e) {
@@ -381,6 +457,11 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     }
   }
 
+  /**
+   * Get the remote {@link Cache} object from a remote object registry.
+   *
+   * @return the {@link Cloud.DatabaseOps} cache instance
+   */
   private static Cloud.DatabaseOps getCache() throws MalformedURLException, RemoteException {
     Cloud.DatabaseOps cache = null;
     try {
@@ -409,19 +490,35 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     }
   }
 
+  /**
+   * Master remote operation: get tier information by vmID.
+   *
+   * @param id virtual machine's id
+   * @return 0 for frontend server, 1 for mid-tier server
+   */
   @Override
   public int getTier(int id) throws RemoteException {
     if (!id2TierMap.containsKey(id)) {
       return -1;
     }
-
     return id2TierMap.get(id);
   }
 
+  /**
+   * Master remote operation: scale out one server by the given tier.
+   *
+   * @param tierId 0 for frontend server, 1 for mid-tier server
+   */
   public void scaleOut(int tierId) throws RemoteException {
     scaleOutCore(tierId);
   }
 
+  /**
+   * Get the count of VM of the given tier.
+   *
+   * @param tierId 0 for frontend server, 1 for mid-tier server
+   * @return the count of VM of the given tier, -1 if tierId is invalid
+   */
   @Override
   public int getVMCount(int tierId) {
     if (tierId == 0) {
@@ -432,16 +529,31 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     return -1;
   }
 
+  /**
+   * Master remote operation: get one request from the request queue maintain by the master server.
+   *
+   * @return the {@link Cloud.FrontEndOps.Request} object
+   */
   @Override
   public Cloud.FrontEndOps.Request pollRequest() {
     return requestQueue.poll();
   }
 
+  /**
+   * Master remote operation: Add one request to the request queue maintain by the master server.
+   *
+   * @param request the {@link Cloud.FrontEndOps.Request} object
+   */
   @Override
   public void addRequest(Cloud.FrontEndOps.Request request) {
     requestQueue.add(request);
   }
 
+  /**
+   * Master remote operation: Get the length of the request queue maintain by the master server.
+   *
+   * @return queue length
+   */
   @Override
   public int getRequestLength() {
     return requestQueue.size();
