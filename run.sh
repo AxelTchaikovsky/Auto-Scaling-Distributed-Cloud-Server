@@ -29,4 +29,4 @@ make
 # VM: 507
 
 #java Cloud 6666 lib/db1.txt e-125-333 0 60
-#java Cloud 6666 lib/db1.txt u-90-180-333 0 60
+java Cloud 6666 lib/db1.txt u-90-180-333 0 60

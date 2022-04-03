@@ -1,6 +1,9 @@
 import java.io.IOException;
 import java.net.MalformedURLException;
-import java.rmi.*;
+import java.rmi.AlreadyBoundException;
+import java.rmi.Naming;
+import java.rmi.NotBoundException;
+import java.rmi.RemoteException;
 import java.rmi.server.RMISocketFactory;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.Date;
@@ -10,13 +13,13 @@ import java.util.concurrent.LinkedBlockingQueue;
 public class Server extends UnicastRemoteObject implements ServerInterface {
   private static final int FRONT = 0;
   private static final int MID = 1;
-  private static int allowedMasterProcess = 15;
   private static final double frontFactor = 2.9;
-  private static final int addFrontInterval = 4000;
+  private static final int addFrontInterval = 3000;
   private static final double midFactor = 3.3;
   private static final long allowedIdleCycle = 2000;
   private static final ServerInfo info = new ServerInfo();
   private static final int fastRequestInterval = 400;
+  private static int allowedMasterProcess = 15;
   private static int frontCount = 0;
   private static int midCount = 0;
   private static long lastProcessTime = 0;
@@ -152,6 +155,12 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     }
   }
 
+  /**
+   * Mid-tier server scale in/out strategy
+   *
+   * @param master master server instance
+   * @param cache  cache instance
+   */
   private static void midRoutine(ServerInterface master, Cloud.DatabaseOps cache) throws IOException {
     Date now = new Date();
     int midMasterCnt = master.getVMCount(1);
@@ -250,14 +259,17 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     if (timeDiff > 1000) {
       int queueLen = SL.getQueueLength();
       if (queueLen != 0) {
-        if (timeDiff / queueLen < 185) {
-          System.err.println("[ Rate over 1000/150, start 3 mid 1 front ]");
+        long interval = timeDiff / queueLen;
+        if (interval < 185) {
+          System.err.println("[ Rate over 1000/185, start 3 mid 1 front ]");
           masterScaleOut(0);
           masterScaleOut(1);
           masterScaleOut(1);
           masterScaleOut(1);
           masterScaleOut(1);
           allowedMasterProcess = 25;
+        } else if (interval < 250) {
+          masterScaleOut(1);
         }
       }
       masterStartTime = Long.MAX_VALUE;
