@@ -1,11 +1,6 @@
-/* Server */
-
 import java.io.IOException;
 import java.net.MalformedURLException;
-import java.rmi.AlreadyBoundException;
-import java.rmi.Naming;
-import java.rmi.NotBoundException;
-import java.rmi.RemoteException;
+import java.rmi.*;
 import java.rmi.server.RMISocketFactory;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.Date;
@@ -15,8 +10,8 @@ import java.util.concurrent.LinkedBlockingQueue;
 public class Server extends UnicastRemoteObject implements ServerInterface {
   private static final int FRONT = 0;
   private static final int MID = 1;
-  private static final int allowedMasterProcess = 15;
-  private static final double frontFactor = 2.8;
+  private static int allowedMasterProcess = 15;
+  private static final double frontFactor = 2.9;
   private static final int addFrontInterval = 4000;
   private static final double midFactor = 3.3;
   private static final long allowedIdleCycle = 2000;
@@ -36,7 +31,6 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
   private static String ip;
   private static int port;
   private static int vmId;
-  private static int nullRequestCount = 0;
 
   /**
    * Creates and exports a new UnicastRemoteObject object using an anonymous port.
@@ -66,18 +60,25 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
       registerMaster(ip, port);
       masterHandler();
     } else {
-      ServerInterface master = getInstance("Master");
-      switch (master.getTier(vmId)) {
-        case FRONT:
-          frontHandler(master);
-          break;
-        case MID:
-          midHandler(master);
-          break;
-        default:
-          assert false;
-          break;
-      }
+      slaveHandler();
+    }
+  }
+
+  /**
+   * Handle slave server life cycle.
+   */
+  private static void slaveHandler() throws RemoteException, MalformedURLException {
+    ServerInterface master = getInstance("Master");
+    switch (master.getTier(vmId)) {
+      case FRONT:
+        frontHandler(master);
+        break;
+      case MID:
+        midHandler(master);
+        break;
+      default:
+        assert false;
+        break;
     }
   }
 
@@ -93,15 +94,15 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
      6. ++ master's frontend counter
      7. Add 1 new front-end server and 1 new mid-tier server
     */
-    Date now = new Date();
     startCache(ip, port);
     info.setMaster(true);
     addVM2Map(vmId, 0);
     SL.register_frontend();
+    Date now = new Date();
     masterStartTime = now.getTime();
     frontCount++;
-    masterScaleOut(0);
     masterScaleOut(1);
+    masterScaleOut(0);
 
     try {
       while (true) {
@@ -161,7 +162,9 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     }
     Cloud.FrontEndOps.Request r = master.pollRequest();
     if (r != null) {
-      if (dropFastRequest(r)) return;
+      if (dropFastRequest(r)) {
+        return;
+      }
       if (masterRequestLen > midMasterCnt * midFactor) {
         master.scaleOut(1);
         SL.drop(r);
@@ -174,29 +177,6 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
       if (lastProcessTime == 0) {
         lastProcessTime = now.getTime();
       }
-    }
-  }
-
-  private static void midRoutine2(ServerInterface master, Cloud.DatabaseOps cache) throws IOException {
-    int midMasterCnt = master.getVMCount(1);
-    int masterRequestLen = master.getRequestLength();
-    if (nullRequestCount > 5 && midMasterCnt > 1) {
-      shutDown(info.getId());
-      nullRequestCount = 0;
-      return;
-    }
-    Cloud.FrontEndOps.Request r = master.pollRequest();
-    if (r != null) {
-      if (dropFastRequest(r)) return;
-      if (masterRequestLen > midMasterCnt * midFactor) {
-        master.scaleOut(1);
-        SL.drop(r);
-        SL.dropTail();
-      } else {
-        SL.processRequest(r, cache);
-      }
-    } else {
-      nullRequestCount++;
     }
   }
 
@@ -249,7 +229,7 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     int masterRequestLen = master.getRequestLength();
     if (masterRequestLen < 2) {
       shortQueueCount++;
-      if (shortQueueCount > 65 && frontMasterCnt > 1) {
+      if (shortQueueCount > 55 && frontMasterCnt > 1) {
         shutDown(info.getId());
         return true;
       }
@@ -258,22 +238,6 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     }
     return false;
   }
-
-  private static boolean midScaleIn(ServerInterface master) throws RemoteException {
-    int midMasterCnt = master.getVMCount(1);
-    int masterRequestLen = master.getRequestLength();
-    if (masterRequestLen < 1) {
-      shortQueueCount++;
-      if (shortQueueCount > 60 && midMasterCnt > 1) {
-        shutDown(info.getId());
-        return true;
-      }
-    } else {
-      shortQueueCount = 0;
-    }
-    return false;
-  }
-
 
   /**
    * Master's procedure when the first mid-tier sever is still booting. Process at most 15 requests
@@ -283,11 +247,8 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
   private static void handleBooting() {
     Date now = new Date();
     long timeDiff = now.getTime() - masterStartTime;
-//    System.err.println("[ Started for:" + timeDiff + "; queue len: " + SL.getQueueLength() + "
-//    ]");
     if (timeDiff > 1000) {
       int queueLen = SL.getQueueLength();
-//      System.err.println("[ Started for:" + timeDiff + "; queue len: " + queueLen + " ]");
       if (queueLen != 0) {
         if (timeDiff / queueLen < 185) {
           System.err.println("[ Rate over 1000/150, start 3 mid 1 front ]");
@@ -295,6 +256,8 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
           masterScaleOut(1);
           masterScaleOut(1);
           masterScaleOut(1);
+          masterScaleOut(1);
+          allowedMasterProcess = 25;
         }
       }
       masterStartTime = Long.MAX_VALUE;
@@ -405,7 +368,6 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
       assert master != null;
       master.deleteVMFromMap(vmId);
     } catch (RemoteException e) {
-      // TODO: Shut down exception connection refused (283) and unmarshall (283)
       e.printStackTrace(System.err);
     }
     System.exit(0);
@@ -559,10 +521,6 @@ public class Server extends UnicastRemoteObject implements ServerInterface {
     return requestQueue.size();
   }
 
-  @Override
-  public ServerLib getSL() {
-    return SL;
-  }
 }
 
 

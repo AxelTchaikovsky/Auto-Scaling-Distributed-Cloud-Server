@@ -14,7 +14,5 @@ public interface ServerInterface extends Remote {
 
   void deleteVMFromMap(int vmId) throws RemoteException;
 
-  ServerLib getSL() throws RemoteException;
-
   void scaleOut(int i) throws RemoteException;
 }
