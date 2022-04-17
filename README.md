@@ -28,7 +28,7 @@ Master’s procedure when the first mid-tier sever is still booting. Process at 
 
 ### Scale Out and Scale In Strategies
 
-See  [15_640_P3_Write_Up.pdf](/Users/adam/Library/CloudStorage/OneDrive-Personal/CMU F21/15640/15440-p3/15_640_P3_Write_Up.pdf) 
+See  [15_640_P3_Write_Up.pdf](15_640_P3_Write_Up.pdf) 
 
 ## Miscellaneous
 
